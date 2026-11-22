@@ -34,6 +34,38 @@ def _parse_brand_list(raw_matched: str | None, fallback_list: list[str] | None) 
     return list(fallback_list or [])
 
 
+def _build_override_rows_and_schema(ov_records: list[Any]) -> tuple[list[tuple[Any, ...]], T.StructType]:
+    """Builds plain typed tuples and explicit Spark schema to bypass PySpark pandas/distutils conversion."""
+    schema = T.StructType(
+        [
+            T.StructField("override_id", T.StringType(), False),
+            T.StructField("target_key_type", T.StringType(), False),
+            T.StructField("target_key_value", T.StringType(), False),
+            T.StructField("field_name", T.StringType(), False),
+            T.StructField("ai_value", T.StringType(), True),
+            T.StructField("human_value", T.StringType(), False),
+            T.StructField("reviewer", T.StringType(), False),
+            T.StructField("reason", T.StringType(), False),
+            T.StructField("created_at", T.TimestampType(), False),
+        ]
+    )
+    rows = [
+        (
+            r.override_id,
+            r.target_key_type,
+            r.target_key_value,
+            r.field_name,
+            r.ai_value,
+            r.human_value,
+            r.reviewer,
+            r.reason,
+            r.created_at,
+        )
+        for r in ov_records
+    ]
+    return rows, schema
+
+
 def run_silver_to_gold(
     spark: SparkSession,
     *,
@@ -100,8 +132,8 @@ def run_silver_to_gold(
     # Apply overrides in Spark with strict precedence: asset_id > media_hash_key > theme_label, latest created_at wins
     ov_theme_sdf = None
     if ov_records:
-        ov_pdf = HumanOverrideStore(overrides_dir).to_dataframe()
-        ov_sdf = spark.createDataFrame(ov_pdf)
+        ov_rows, ov_schema = _build_override_rows_and_schema(ov_records)
+        ov_sdf = spark.createDataFrame(ov_rows, schema=ov_schema)
         ov_asset = (
             ov_sdf.filter(F.col("target_key_type") == "asset_id")
             .withColumn(

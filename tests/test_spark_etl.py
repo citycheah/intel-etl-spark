@@ -1,6 +1,7 @@
 import datetime as dt
 import os
 import shutil
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -8,7 +9,7 @@ from intel_core.schemas import validate_records
 from intel_core.storage import HumanOverrideStore, read_parquet_table
 
 from intel_etl_spark.jobs.bronze_to_silver import get_spark_session, run_bronze_to_silver
-from intel_etl_spark.jobs.silver_to_gold import run_silver_to_gold
+from intel_etl_spark.jobs.silver_to_gold import _build_override_rows_and_schema, run_silver_to_gold
 from intel_etl_spark.local_runner import run_local_bronze_to_silver, run_local_silver_to_gold
 from scripts.generate_eu_auto_dgp import generate_eu_auto_dgp
 
@@ -206,3 +207,44 @@ def test_medallion_spark_etl_end_to_end(tmp_path):
         validate_records("fct_ad_delivery_weekly", fct_df.head(10).to_dict(orient="records"))
     finally:
         spark.stop()
+
+
+def test_spark_override_rows_avoid_pandas_conversion(tmp_path: Path):
+    """Ensures Spark job 2 builds overrides from typed tuples without pyspark.sql.pandas (`distutils` removed in 3.12)."""
+    from pyspark.sql import types as T
+
+    ov_store = HumanOverrideStore(tmp_path / "overrides")
+    ov_store.write_override(
+        target_key_type="asset_id",
+        target_key_value="asset_001",
+        field_name="matched_brand_id",
+        human_value="BMW",
+        reviewer="qa",
+        ai_value=None,
+        created_at=dt.datetime(2026, 2, 1, 10, 0, tzinfo=dt.UTC),
+    )
+    ov_store.write_override(
+        target_key_type="media_hash_key",
+        target_key_value="hash_002",
+        field_name="theme_label",
+        human_value="EV Range",
+        reviewer="qa",
+        ai_value="Charging",
+        created_at=dt.datetime(2026, 2, 1, 11, 0, tzinfo=dt.UTC),
+    )
+
+    records = ov_store.list_overrides()
+    rows, schema = _build_override_rows_and_schema(records)
+    assert len(rows) == 2
+    assert all(isinstance(r, tuple) and len(r) == 9 for r in rows)
+    assert any(r[4] is None for r in rows)
+    assert len(schema.fields) == 9
+    ai_field = next(f for f in schema.fields if f.name == "ai_value")
+    ts_field = next(f for f in schema.fields if f.name == "created_at")
+    assert ai_field.nullable is True
+    assert isinstance(ts_field.dataType, T.TimestampType)
+
+    job_src = (Path(__file__).resolve().parents[1] / "intel_etl_spark" / "jobs" / "silver_to_gold.py").read_text(
+        encoding="utf-8"
+    )
+    assert ".to_dataframe()" not in job_src
